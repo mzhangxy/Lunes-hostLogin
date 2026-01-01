@@ -23,7 +23,7 @@ jobs:
           npm install puppeteer-extra puppeteer-extra-plugin-stealth axios
           # 如果使用了 dotenv：npm install dotenv
 
-      - name: Install Chromium system dependencies (Ubuntu 24.04 compatible)
+      - name: Install Chromium system dependencies (Ubuntu 24.04 - minimal & reliable)
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -40,7 +40,7 @@ jobs:
             libfontconfig1 \
             libgbm1 \
             libglib2.0-0 \
-            libgtk-3-0t64 \           # ← Ubuntu 24.04 中已改为 t64 版本
+            libgtk-3-0 \              # ← 正确包名：libgtk-3-0（虚拟包指向 libgtk-3-0t64）
             libnspr4 \
             libnss3 \
             libpango-1.0-0 \
@@ -60,7 +60,9 @@ jobs:
             libxtst6 \
             lsb-release \
             wget \
-            xdg-utils
+            xdg-utils \
+            libgdk-pixbuf-2.0-0 \      # 额外添加常用依赖，避免潜在缺失
+            libxshmfence1
 
       - name: Run login script
         env:
@@ -70,4 +72,4 @@ jobs:
           CAPTCHA_API_KEY: ${{ secrets.CAPTCHA_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: node login.js  # 确保脚本文件名正确
+        run: node login.js  # 确保你的脚本文件名为 login.js
