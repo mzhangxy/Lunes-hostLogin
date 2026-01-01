@@ -1,5 +1,8 @@
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const axios = require('axios');
+
+puppeteer.use(StealthPlugin());
 
 async function sendTelegramMessage(botToken, chatId, message) {
   const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
@@ -16,13 +19,44 @@ async function solveTurnstile(page, sitekey, pageUrl) {
   const apiKey = process.env.CAPTCHA_API_KEY;
   if (!apiKey) throw new Error('CAPTCHA_API_KEY 未设置');
 
-  const submitTaskRes = await axios.post('http://2captcha.com/in.php', {
+  // 注入脚本以捕获额外参数（针对Challenge pages）
+  await page.evaluateOnNewDocument(() => {
+    const i = setInterval(() => {
+      if (window.turnstile) {
+        clearInterval(i);
+        const originalRender = window.turnstile.render;
+        window.turnstile.render = (widget, options) => {
+          window.tsParams = {
+            sitekey: options.sitekey,
+            action: options.action,
+            cData: options.cData,
+            chlPageData: options.chlPageData,
+            callback: options.callback
+          };
+          // 不实际渲染widget，防止自动执行
+          return 'mock-widget-id';
+        };
+      }
+    }, 50);
+  });
+
+  // 重新加载页面以应用注入
+  await page.reload({ waitUntil: 'networkidle2' });
+
+  // 提取额外参数，如果存在
+  const tsParams = await page.evaluate(() => window.tsParams || {});
+  const params = {
     key: apiKey,
     method: 'turnstile',
-    sitekey: sitekey,
+    sitekey: sitekey || tsParams.sitekey,
     pageurl: pageUrl,
     json: 1
-  });
+  };
+  if (tsParams.action) params.action = tsParams.action;
+  if (tsParams.cData) params.data = tsParams.cData;
+  if (tsParams.chlPageData) params.pagedata = tsParams.chlPageData;
+
+  const submitTaskRes = await axios.post('https://2captcha.com/in.php', params);
 
   if (submitTaskRes.data.status !== 1) {
     throw new Error(`提交任务失败: ${submitTaskRes.data.request}`);
@@ -31,9 +65,9 @@ async function solveTurnstile(page, sitekey, pageUrl) {
   const taskId = submitTaskRes.data.request;
 
   let result;
-  for (let i = 0; i < 24; i++) {
+  for (let i = 0; i < 30; i++) {  // 增加到30次，约2.5分钟
     await page.waitForTimeout(5000);
-    const getResultRes = await axios.get(`http://2captcha.com/res.php?key=${apiKey}&action=get&id=${taskId}&json=1`);
+    const getResultRes = await axios.get(`https://2captcha.com/res.php?key=${apiKey}&action=get&id=${taskId}&json=1`);
     if (getResultRes.data.status === 1) {
       result = getResultRes.data.request;
       break;
@@ -46,21 +80,34 @@ async function solveTurnstile(page, sitekey, pageUrl) {
 
   if (!result) throw new Error('Turnstile 解决超时');
 
-  await page.evaluate((token) => {
-    const textarea = document.querySelector('textarea[name="cf-turnstile-response"]');
-    if (textarea) {
-      textarea.value = token;
-    } else {
-      if (window.turnstileCallback) {
-        window.turnstileCallback({ token });
-      }
+  // 如果有useragent（针对Challenge），设置User-Agent
+  if (result.useragent) {
+    await page.setUserAgent(result.useragent);
+    await page.reload({ waitUntil: 'networkidle2' });
+  }
+
+  // 注入token
+  await page.evaluate((token, callbackName) => {
+    const input = document.querySelector('input[name="cf-turnstile-response"]');
+    if (input) {
+      input.value = token;
+    } else if (callbackName && window[callbackName]) {
+      window[callbackName](token);
+    } else if (window.tsParams && window.tsParams.callback) {
+      window.tsParams.callback(token);
     }
-  }, result);
+  }, result.token || result, tsParams.callback);
 
   console.log('Turnstile 已解决');
 }
 
 async function login() {
+  // 检查所有必需环境变量
+  const requiredEnvs = ['WEBSITE_URL', 'USERNAME', 'PASSWORD', 'CAPTCHA_API_KEY', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'];
+  for (const env of requiredEnvs) {
+    if (!process.env[env]) throw new Error(`${env} 未设置`);
+  }
+
   const browser = await puppeteer.launch({
     headless: true,
     args: [
@@ -80,11 +127,12 @@ async function login() {
     await page.type('#email', process.env.USERNAME);
     await page.type('#password', process.env.PASSWORD);
 
-    await page.waitForSelector('.g-recaptcha', { timeout: 10000 });
+    // 等待Turnstile元素
+    await page.waitForSelector('.cf-turnstile', { timeout: 15000 });
 
     const sitekey = await page.evaluate(() => {
-      const el = document.querySelector('.g-recaptcha');
-      return el ? el.dataset.sitekey : null;
+      const el = document.querySelector('.cf-turnstile');
+      return el ? el.getAttribute('data-sitekey') : null;
     });
     if (!sitekey) throw new Error('未找到 sitekey');
     const currentUrl = page.url();
@@ -93,11 +141,14 @@ async function login() {
 
     await page.click('button[type="submit"]');
 
-    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 });
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 });
 
     const currentUrlAfter = page.url();
     const title = await page.title();
-    if (currentUrlAfter.includes('/') && !title.includes('Login')) {
+
+    // 改进成功判断：检查是否重定向到非登录页，或检查特定元素
+    const isSuccess = !currentUrlAfter.includes('login') && !title.toLowerCase().includes('login');
+    if (isSuccess) {
       await sendTelegramMessage(process.env.TELEGRAM_BOT_TOKEN, process.env.TELEGRAM_CHAT_ID, `*登录成功！*\n时间: ${new Date().toISOString()}\n页面: ${currentUrlAfter}\n标题: ${title}`);
       console.log('登录成功！当前页面：', currentUrlAfter);
     } else {
@@ -106,10 +157,11 @@ async function login() {
 
     console.log('脚本执行完成。');
   } catch (error) {
-    await page.screenshot({ path: 'login-failure.png', fullPage: true });
-    await sendTelegramMessage(process.env.TELEGRAM_BOT_TOKEN, process.env.TELEGRAM_CHAT_ID, `*登录失败！*\n时间: ${new Date().toISOString()}\n错误: ${error.message}\n请检查 Artifacts 中的 login-debug`);
+    const screenshotPath = `login-failure-${Date.now()}.png`;  // 动态文件名避免覆盖
+    await page.screenshot({ path: screenshotPath, fullPage: true });
+    await sendTelegramMessage(process.env.TELEGRAM_BOT_TOKEN, process.env.TELEGRAM_CHAT_ID, `*登录失败！*\n时间: ${new Date().toISOString()}\n错误: ${error.message}\n请检查 Artifacts 中的 ${screenshotPath}`);
     console.error('登录失败：', error.message);
-    console.error('截屏已保存为 login-failure.png');
+    console.error(`截屏已保存为 ${screenshotPath}`);
     throw error;
   } finally {
     await browser.close();
